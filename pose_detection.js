@@ -85,28 +85,63 @@ export async function detectPoseAndPlaceMarkers(viewer, onProgress) {
     const landmarks = results.poseLandmarks;
     const markers = new Map();
 
-    // Get canvas dimensions for coordinate conversion
-    const canvasWidth = viewer.canvas.width;
-    const canvasHeight = viewer.canvas.height;
+    // Get model bounds for better depth estimation
+    const modelBounds = new THREE.Box3().setFromObject(viewer.model);
+    const modelCenter = modelBounds.getCenter(new THREE.Vector3());
+    const modelSize = modelBounds.getSize(new THREE.Vector3());
 
     // Helper to convert 2D screen coords to 3D world position via raycasting
-    const screenTo3D = (x, y, z) => {
+    const screenTo3D = (x, y, z, landmarkName = '') => {
         // MediaPipe gives normalized coords (0-1), convert to NDC (-1 to 1)
         const ndcX = (x * 2) - 1;
         const ndcY = -(y * 2) + 1; // Flip Y axis
 
+        // Try direct raycast first
         viewer.raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), viewer.camera);
-        const intersects = viewer.raycaster.intersectObject(viewer.model, true);
+        let intersects = viewer.raycaster.intersectObject(viewer.model, true);
 
         if (intersects.length > 0) {
-            return intersects[0].point.clone();
+            // Filter out intersects that are too far from model center (avoid hitting wrong parts)
+            const validIntersects = intersects.filter(hit => 
+                hit.point.distanceTo(modelCenter) < modelSize.length()
+            );
+            if (validIntersects.length > 0) {
+                return validIntersects[0].point.clone();
+            }
         }
 
-        // Improved fallback: use MediaPipe's z-depth to estimate position
+        // If direct raycast fails, try with slight offsets in a grid pattern
+        const offsetAmount = 0.02; // Small offset in NDC space
+        const offsets = [
+            [0, offsetAmount], [0, -offsetAmount],
+            [offsetAmount, 0], [-offsetAmount, 0],
+            [offsetAmount, offsetAmount], [-offsetAmount, -offsetAmount],
+            [offsetAmount, -offsetAmount], [-offsetAmount, offsetAmount]
+        ];
+
+        for (const [ox, oy] of offsets) {
+            viewer.raycaster.setFromCamera(new THREE.Vector2(ndcX + ox, ndcY + oy), viewer.camera);
+            intersects = viewer.raycaster.intersectObject(viewer.model, true);
+            
+            if (intersects.length > 0) {
+                const validIntersects = intersects.filter(hit => 
+                    hit.point.distanceTo(modelCenter) < modelSize.length()
+                );
+                if (validIntersects.length > 0) {
+                    return validIntersects[0].point.clone();
+                }
+            }
+        }
+
+        // Advanced fallback: use MediaPipe's z-depth with model bounds
         // z is normalized depth (0 = close, higher = far)
-        const depthScale = 2.0; // Scale factor for depth
-        const baseDepth = 1.0; // Base distance from camera
-        const estimatedDepth = baseDepth + (z * depthScale);
+        const cameraToModel = modelCenter.distanceTo(viewer.camera.position);
+        
+        // Estimate depth based on z value and model position
+        // Closer landmarks (z near 0) should be near the front of the model
+        // Further landmarks should be proportionally deeper
+        const zRange = modelSize.z * 0.5; // Half the model depth
+        const estimatedDepth = cameraToModel - zRange + (z * zRange * 2);
         
         // Create a ray from the camera through the screen point
         const vector = new THREE.Vector3(ndcX, ndcY, 0.5);
@@ -114,14 +149,21 @@ export async function detectPoseAndPlaceMarkers(viewer, onProgress) {
         const dir = vector.sub(viewer.camera.position).normalize();
         
         // Project to estimated depth
-        return viewer.camera.position.clone().add(dir.multiplyScalar(estimatedDepth));
+        const fallbackPoint = viewer.camera.position.clone().add(dir.multiplyScalar(estimatedDepth));
+        
+        // Clamp to model bounds to ensure reasonable placement
+        fallbackPoint.x = THREE.MathUtils.clamp(fallbackPoint.x, modelBounds.min.x, modelBounds.max.x);
+        fallbackPoint.y = THREE.MathUtils.clamp(fallbackPoint.y, modelBounds.min.y, modelBounds.max.y);
+        fallbackPoint.z = THREE.MathUtils.clamp(fallbackPoint.z, modelBounds.min.z, modelBounds.max.z);
+        
+        return fallbackPoint;
     };
 
     // Direct mappings
     for (const [markerId, landmarkIdx] of Object.entries(POSE_LANDMARK_MAP)) {
         if (landmarkIdx !== null && landmarks[landmarkIdx]) {
             const lm = landmarks[landmarkIdx];
-            const pos3D = screenTo3D(lm.x, lm.y, lm.z);
+            const pos3D = screenTo3D(lm.x, lm.y, lm.z, markerId);
             markers.set(markerId, pos3D);
         }
     }
@@ -130,7 +172,7 @@ export async function detectPoseAndPlaceMarkers(viewer, onProgress) {
     // Head (use nose but offset upward)
     if (landmarks[0]) {
         const nose = landmarks[0];
-        const pos3D = screenTo3D(nose.x, nose.y - 0.1, nose.z); // Offset up
+        const pos3D = screenTo3D(nose.x, nose.y - 0.08, nose.z, 'head'); // Offset up
         markers.set('head', pos3D);
     }
 
